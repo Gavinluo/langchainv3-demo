@@ -1,0 +1,367 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Configuration;
+using System.Data;
+using System.Drawing;
+using System.Linq;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+namespace POCChat
+{
+	public partial class DemoFormChat : Form
+	{
+		private FlowLayoutPanel chatPanel;
+		private TextBox inputBox;
+		private Button sendButton;
+		private Panel bottomPanel;
+		private HttpClient httpClient;
+		private System.Windows.Forms.Timer typewriterTimer;
+		private string currentAIResponse;
+		private int currentCharIndex;
+		private ChatBubble currentAIBubble;
+		private bool isProcessingCode;
+		private StringBuilder currentCodeBlock;
+		private string currentCodeLanguage;
+		private readonly string apiKey;
+
+		private const int AVATAR_SIZE = 40;
+		private const int BUBBLE_PADDING = 10;
+		private bool isUserMessage = false;
+
+		public DemoFormChat()
+		{
+			InitializeComponent();
+			//从环境变量中获取ApiKey
+			apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+			if (string.IsNullOrEmpty(apiKey))
+			{
+				MessageBox.Show("请在App.config中配置OpenAI API密钥", "配置错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+				Application.Exit();
+			}
+			InitializeUI();
+			InitializeHttpClient();
+		}
+
+		private void InitializeUI()
+		{
+			// 设置窗体属性
+			this.Text = "AI Chat";
+			this.Size = new Size(800, 600);
+			this.MinimumSize = new Size(400, 300);
+
+			// 创建聊天面板
+			chatPanel = new FlowLayoutPanel
+			{
+				Dock = DockStyle.Fill,
+				AutoScroll = true,
+				FlowDirection = FlowDirection.TopDown,
+				WrapContents = false,
+				Padding = new Padding(10),
+				BackColor = Color.FromArgb(240, 240, 240),
+				AutoScrollMargin = new Size(0, 20)
+			};
+
+			// 创建底部输入面板
+			bottomPanel = new Panel
+			{
+				Dock = DockStyle.Bottom,
+				Height = 60,
+				Padding = new Padding(10),
+				BackColor = Color.White
+			};
+
+			// 创建输入框
+			inputBox = new TextBox
+			{
+				Dock = DockStyle.Fill,
+				Font = new Font("Microsoft YaHei", 10F),
+				Multiline = true,
+				AcceptsReturn = true,
+				WordWrap = true,
+				ScrollBars = ScrollBars.None,
+				MinimumSize = new Size(0, 40),
+				MaximumSize = new Size(0, 100)
+			};
+			inputBox.TextChanged += InputBox_TextChanged;
+			inputBox.KeyDown += InputBox_KeyDown;
+
+			// 创建发送按钮
+			sendButton = new Button
+			{
+				Text = "发送",
+				Dock = DockStyle.Right,
+				Width = 80,
+				Height = 40,
+				FlatStyle = FlatStyle.Flat,
+				BackColor = Color.FromArgb(0, 120, 212),
+				ForeColor = Color.White
+			};
+			sendButton.Click += SendButton_Click;
+
+			// 添加控件
+			bottomPanel.Controls.Add(inputBox);
+			bottomPanel.Controls.Add(sendButton);
+			this.Controls.Add(chatPanel);
+			this.Controls.Add(bottomPanel);
+
+			// 初始化打字机效果计时器
+			typewriterTimer = new System.Windows.Forms.Timer
+			{
+				Interval = 30
+			};
+			typewriterTimer.Tick += TypewriterTimer_Tick;
+
+			// 添加窗体大小改变事件处理
+			this.SizeChanged += (s, e) => UpdateChatBubbleLayout();
+		}
+
+		private void InitializeHttpClient()
+		{
+			httpClient = new HttpClient();
+			httpClient.BaseAddress = new Uri("https://api.openai.com/v1/");
+			httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {apiKey}");
+		}
+
+		private async void SendButton_Click(object sender, EventArgs e)
+		{
+			if (string.IsNullOrWhiteSpace(inputBox.Text))
+				return;
+
+			sendButton.Enabled = false;
+			inputBox.Enabled = false;
+
+			try
+			{
+				// 添加用户消息
+				var userBubble = new ChatBubble(inputBox.Text, true);
+				AddChatBubble(userBubble);
+
+				// 发送消息到OpenAI
+				var userMessage = inputBox.Text;
+				inputBox.Text = "";
+
+				// 添加AI消息气泡（显示思考中）
+				currentAIBubble = new ChatBubble("思考中...", false);
+				AddChatBubble(currentAIBubble);
+
+				var response = await SendToOpenAI(userMessage);
+				Console.WriteLine(response);
+				currentAIResponse = response;
+				currentCharIndex = 0;
+				isProcessingCode = false;
+				currentCodeBlock = new StringBuilder();
+				currentAIBubble.UpdateText(""); // 清空思考中的文字
+				typewriterTimer.Start();
+			}
+			catch (Exception ex)
+			{
+				MessageBox.Show($"发生错误：{ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+				if (currentAIBubble != null)
+				{
+					currentAIBubble.UpdateText("抱歉，发生错误了...");
+				}
+			}
+			finally
+			{
+				sendButton.Enabled = true;
+				inputBox.Enabled = true;
+				inputBox.Focus();
+			}
+		}
+
+		private void UpdateChatBubbleLayout()
+		{
+			if (chatPanel != null)
+			{
+				foreach (Control control in chatPanel.Controls)
+				{
+					control.Width = chatPanel.ClientSize.Width - 20;
+				}
+			}
+		}
+
+		private void AddChatBubble(Control bubble)
+		{
+			chatPanel.Controls.Add(bubble);
+			bubble.Width = chatPanel.ClientSize.Width - 20;
+			chatPanel.ScrollControlIntoView(bubble);
+		}
+
+		private async Task<string> SendToOpenAI(string message)
+		{
+			var requestBody = new
+			{
+				model = "gpt-3.5-turbo",
+				messages = new[]
+				{
+					new { role = "user", content = message }
+				}
+			};
+
+			var content = new StringContent(
+				JsonSerializer.Serialize(requestBody),
+				Encoding.UTF8,
+				"application/json"
+			);
+
+			var response = await httpClient.PostAsync("chat/completions", content);
+			response.EnsureSuccessStatusCode();
+			var responseBody = await response.Content.ReadAsStringAsync();
+			var jsonResponse = JsonSerializer.Deserialize<JsonElement>(responseBody);
+
+			return jsonResponse.GetProperty("choices")[0]
+				.GetProperty("message")
+				.GetProperty("content")
+				.GetString();
+		}
+
+		private void TypewriterTimer_Tick(object sender, EventArgs e)
+		{
+			if (currentCharIndex < currentAIResponse.Length)
+			{
+				var currentChar = currentAIResponse[currentCharIndex];
+
+				// 检测代码块开始
+				if (currentCharIndex + 3 <= currentAIResponse.Length &&
+					currentAIResponse.Substring(currentCharIndex, Math.Min(3, currentAIResponse.Length - currentCharIndex)) == "```")
+				{
+					if (!isProcessingCode)
+					{
+						// 开始新的代码块
+						isProcessingCode = true;
+						currentCodeBlock.Clear();
+
+						// 获取语言类型
+						var endOfLine = currentAIResponse.IndexOf('\n', currentCharIndex);
+						if (endOfLine > currentCharIndex + 3)
+						{
+							currentCodeLanguage = currentAIResponse.Substring(currentCharIndex + 3, endOfLine - (currentCharIndex + 3)).Trim();
+							currentCharIndex = endOfLine + 1;
+						}
+						else
+						{
+							currentCodeLanguage = "";
+							currentCharIndex += 3;
+						}
+					}
+					else
+					{
+						// 结束代码块
+						isProcessingCode = false;
+						currentCharIndex += 3;
+
+						// 创建并添加代码块
+						if (currentCodeBlock.Length > 0)
+						{
+							var codeBlock = new CodeBlock(currentCodeBlock.ToString().TrimEnd(), currentCodeLanguage);
+							currentAIBubble.AddCodeBlock(codeBlock);
+						}
+						currentCodeBlock.Clear();
+					}
+				}
+				else
+				{
+					if (isProcessingCode)
+					{
+						currentCodeBlock.Append(currentChar);
+					}
+					else
+					{
+						var text = currentAIResponse.Substring(0, currentCharIndex + 1);
+						currentAIBubble.UpdateText(text);
+					}
+					currentCharIndex++;
+				}
+			}
+			else
+			{
+				// 确保最后一个代码块被添加
+				if (isProcessingCode && currentCodeBlock.Length > 0)
+				{
+					var codeBlock = new CodeBlock(currentCodeBlock.ToString().TrimEnd(), currentCodeLanguage);
+					currentAIBubble.AddCodeBlock(codeBlock);
+				}
+				typewriterTimer.Stop();
+			}
+		}
+
+		protected override void OnResize(EventArgs e)
+		{
+			base.OnResize(e);
+			if (chatPanel != null)
+			{
+				foreach (Control control in chatPanel.Controls)
+				{
+					control.Width = chatPanel.ClientSize.Width - 20;
+				}
+			}
+		}
+
+		private void InputBox_TextChanged(object sender, EventArgs e)
+		{
+			int maxHeight = 100;
+			int minHeight = 40;
+			
+			// 计算文本需要的高度
+			Size textSize = TextRenderer.MeasureText(inputBox.Text + "\r\n", inputBox.Font, 
+				new Size(inputBox.ClientSize.Width, int.MaxValue),
+				TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl);
+			
+			// 设置新的高度，但不超过最大高度
+			int newHeight = Math.Min(Math.Max(textSize.Height + 10, minHeight), maxHeight);
+			
+			// 如果高度发生变化，调整底部面板的高度
+			if (bottomPanel.Height != newHeight + 20)
+			{
+				bottomPanel.Height = newHeight + 20;
+				sendButton.Height = bottomPanel.Height - 20;
+			}
+
+			// 根据内容高度决定是否显示滚动条
+			if (textSize.Height > maxHeight - 10)
+			{
+				if (inputBox.ScrollBars != ScrollBars.Vertical)
+				{
+					inputBox.ScrollBars = ScrollBars.Vertical;
+				}
+			}
+			else
+			{
+				if (inputBox.ScrollBars != ScrollBars.None)
+				{
+					inputBox.ScrollBars = ScrollBars.None;
+				}
+			}
+		}
+
+		private void InputBox_KeyDown(object sender, KeyEventArgs e)
+		{
+			if (e.KeyCode == Keys.Enter)
+			{
+				if (e.Control)
+				{
+					// Ctrl+Enter 插入换行
+					int selectionStart = inputBox.SelectionStart;
+					inputBox.Text = inputBox.Text.Insert(selectionStart, Environment.NewLine);
+					inputBox.SelectionStart = selectionStart + Environment.NewLine.Length;
+					e.Handled = true;
+				}
+				else if (!e.Shift)
+				{
+					// 直接回车发送消息
+					e.Handled = true;
+					if (!string.IsNullOrWhiteSpace(inputBox.Text))
+					{
+						SendButton_Click(sender, e);
+					}
+				}
+			}
+		}
+	}
+}
